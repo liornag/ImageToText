@@ -24,8 +24,8 @@ def scan_receipt():
     file.save(filepath)
 
     try:
-        text = pytesseract.image_to_string(Image.open(filepath))
-        # os.remove(filepath)  # delete temp file
+        text = pytesseract.image_to_string(Image.open(filepath), lang='heb+eng')
+        os.remove(filepath)  # delete temp file
         lines = [line.strip() for line in text.split('\n') if line.strip()]
         return jsonify({'items': lines})
     except Exception as e:
