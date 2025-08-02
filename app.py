@@ -1,43 +1,37 @@
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
-import os
-import pytesseract
-from PIL import Image, ImageOps
+from flask_cors import CORS
+import os, json, re, pytesseract, requests
+from PIL import Image, ImageOps, ImageFilter
 from openai import OpenAI
 from dotenv import load_dotenv
-from flask_cors import CORS
-import json
-import re
 
-# === Flask setup ===
+#Flask setup
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins="http://localhost:5173", supports_credentials=True)
+
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# === Load credentials ===
+#Load credentials
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# === Image preprocessing ===
+#Image preprocessing
 def preprocess_image(path):
     img = Image.open(path).convert("L")
+    img = img.filter(ImageFilter.MedianFilter())
     img = ImageOps.autocontrast(img)
     img = ImageOps.invert(img)
+    img = img.point(lambda x: 0 if x < 128 else 255, mode='1')
     img.save(path)
     return path
 
-# === Clean OCR garbage
+#Clean OCR garbage
 def clean_ocr_text(text):
-    return (
-        text.replace('\u200f', '')
-            .replace('\u200e', '')
-            .replace(':', ' ')
-            .replace('₪', '')
-            .replace('ILS', '')
-    )
+    return text.replace('\u200f','').replace('\u200e','').replace(':',' ').replace('₪','').replace('ILS','')
 
-# === GPT Analysis
+#GPT logic
 def ask_gpt_to_analyze(lines):
     prompt = (
         "You will receive raw text extracted from a shopping receipt (in Hebrew or English). "
@@ -72,49 +66,52 @@ def ask_gpt_to_analyze(lines):
     )
 
     gpt_output = response.choices[0].message.content.strip()
-    try:
-        # 💡 Try to extract only JSON array from response
-        json_match = re.search(r"\[\s*{.*?}\s*]", gpt_output, re.DOTALL)
-        if json_match:
-            return json.loads(json_match.group(0))
-        else:
-            print("❌ Could not parse JSON from GPT output:\n", gpt_output)
-            raise ValueError("Invalid JSON from GPT")
-    except Exception as e:
-        print("⚠️ GPT returned invalid JSON:", e)
-        raise ValueError("GPT returned invalid JSON")
+    json_match = re.search(r"\[\s*{.*?}\s*]", gpt_output, re.DOTALL)
+    if json_match:
+        return json.loads(json_match.group(0))
+    else:
+        raise ValueError("GPT did not return valid JSON array")
 
-# === API endpoint
+#API endpoint
 @app.route('/scan-receipt', methods=['POST'])
 def scan_receipt():
-    print("📥 Received file from client.")
-
     if 'image' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
-    file = request.files['image']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
+        return jsonify({'error': 'No image uploaded'}), 400
 
+    file = request.files['image']
     filename = secure_filename(file.filename)
+    base, ext = os.path.splitext(filename)
+    if not ext:
+        ext = '.jpg'
+    filename = base + ext
     path = os.path.join(UPLOAD_FOLDER, filename)
+
+    print("Saving file:", path)
     file.save(path)
 
     try:
         preprocess_image(path)
-        raw_text = pytesseract.image_to_string(Image.open(path), lang='heb+eng')
+        text = pytesseract.image_to_string(Image.open(path), lang='heb+eng', config='--oem 3 --psm 6')
         os.remove(path)
 
-        cleaned_text = clean_ocr_text(raw_text)
-        lines = [line.strip() for line in cleaned_text.split('\n') if line.strip()]
-        print("📝 OCR lines:", lines)
+        lines = [clean_ocr_text(line) for line in text.split('\n') if line.strip()]
+        items = ask_gpt_to_analyze(lines)
 
-        gpt_result = ask_gpt_to_analyze(lines)
-        print("✅ GPT result:", gpt_result)
+        # Forward to main Node.js server to save
+        token = request.headers.get('Authorization', '').replace("Bearer ", "")
+        resp = requests.post(
+            'http://localhost:5000/save-items',
+            json={'items': items},
+            headers={'Authorization': f'Bearer {token}'}
+        )
 
-        return jsonify({'items': gpt_result})
+        if not resp.ok:
+            print("Save to DB failed:", resp.text)
+
+        return jsonify({'items': items})
 
     except Exception as e:
-        print("❌ Error:", e)
+        print("Error:", e)
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
