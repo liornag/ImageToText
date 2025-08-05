@@ -6,32 +6,34 @@ from PIL import Image, ImageOps, ImageFilter
 from openai import OpenAI
 from dotenv import load_dotenv
 
-#Flask setup
+# Flask setup
 app = Flask(__name__)
 CORS(app, origins="http://localhost:5173", supports_credentials=True)
 
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-#Load credentials
+# Load credentials
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-#Image preprocessing
+# Image preprocessing
 def preprocess_image(path):
-    img = Image.open(path).convert("L")
+    img = Image.open(path).convert("L")  
+    img = img.resize((img.width * 2, img.height * 2))  
     img = img.filter(ImageFilter.MedianFilter())
     img = ImageOps.autocontrast(img)
     img = ImageOps.invert(img)
-    img = img.point(lambda x: 0 if x < 128 else 255, mode='1')
+    img = img.point(lambda x: 0 if x < 140 else 255, mode='1')  
     img.save(path)
     return path
 
-#Clean OCR garbage
-def clean_ocr_text(text):
-    return text.replace('\u200f','').replace('\u200e','').replace(':',' ').replace('₪','').replace('ILS','')
 
-#GPT logic
+# Clean OCR garbage
+def clean_ocr_text(text):
+    return text.replace('\u200f', '').replace('\u200e', '').replace(':', ' ').replace('₪', '').replace('ILS', '')
+
+# GPT logic
 def ask_gpt_to_analyze(lines):
     prompt = (
         "You will receive raw text extracted from a shopping receipt (in Hebrew or English). "
@@ -66,13 +68,17 @@ def ask_gpt_to_analyze(lines):
     )
 
     gpt_output = response.choices[0].message.content.strip()
-    json_match = re.search(r"\[\s*{.*?}\s*]", gpt_output, re.DOTALL)
-    if json_match:
-        return json.loads(json_match.group(0))
-    else:
-        raise ValueError("GPT did not return valid JSON array")
+    print("GPT raw output:", gpt_output)  # DEBUG
 
-#API endpoint
+    try:
+        json_match = re.search(r"\[\s*{.*?}\s*]", gpt_output, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group(0))
+        return json.loads(gpt_output)
+    except Exception as e:
+        raise ValueError("GPT returned invalid JSON") from e
+
+# API endpoint
 @app.route('/scan-receipt', methods=['POST'])
 def scan_receipt():
     if 'image' not in request.files:
@@ -91,23 +97,41 @@ def scan_receipt():
 
     try:
         preprocess_image(path)
+
+        print("===> Starting OCR")
         text = pytesseract.image_to_string(Image.open(path), lang='heb+eng', config='--oem 3 --psm 6')
+        print("\n=== OCR TEXT ===")
+        print(text)
+        print("===> OCR Done")
+
         os.remove(path)
 
         lines = [clean_ocr_text(line) for line in text.split('\n') if line.strip()]
-        items = ask_gpt_to_analyze(lines)
+
+        print("===> Sending to GPT")
+        try:
+            items = ask_gpt_to_analyze(lines)
+        except Exception as gpt_error:
+            print("GPT Error:", gpt_error)
+            return jsonify({'error': 'Failed to process receipt with GPT'}), 500
+
+        print("===> GPT Response Received")
 
         # Forward to main Node.js server to save
         token = request.headers.get('Authorization', '').replace("Bearer ", "")
-        resp = requests.post(
-            'http://localhost:5000/save-items',
-            json={'items': items},
-            headers={'Authorization': f'Bearer {token}'}
-        )
+        try:
+            resp = requests.post(
+                'http://localhost:5000/save-items',
+                json={'items': items},
+                headers={'Authorization': f'Bearer {token}'},
+                timeout=5
+            )
+            if not resp.ok:
+                print("Save to DB failed:", resp.text)
+        except Exception as save_error:
+            print("Error saving to Node server:", save_error)
 
-        if not resp.ok:
-            print("Save to DB failed:", resp.text)
-
+        print("===> Returning JSON to client")
         return jsonify({'items': items})
 
     except Exception as e:
