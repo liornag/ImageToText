@@ -1,0 +1,10 @@
+flask
+werkzeug
+flask-cors
+pytesseract
+requests
+pillow
+openai
+python-dotenv
+opencv-python
+numpy

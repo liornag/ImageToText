@@ -1,11 +1,14 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, send_file, jsonify
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
 import os, json, re, pytesseract, requests
 from PIL import Image, ImageOps, ImageFilter
 from openai import OpenAI
 from dotenv import load_dotenv
-
+import numpy as np
+import cv2
+import tempfile
+import os
 # Flask setup
 app = Flask(__name__)
 CORS(app, origins="http://localhost:5173", supports_credentials=True)
@@ -138,5 +141,47 @@ def scan_receipt():
         print("Error:", e)
         return jsonify({'error': str(e)}), 500
 
+@app.route("/crop", methods=["POST"])
+def process_image():
+    # get file
+    file = request.files["image"]
+    points_json = request.form["points"]
+
+    # parse JSON safely
+    points_list = json.loads(points_json)  # list of dicts
+    pts = np.array([[p["x"], p["y"]] for p in points_list], dtype="float32")
+
+    # load image
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    file.save(temp_file.name)
+    image = cv2.imread(temp_file.name)
+
+    # target rectangle (width & height from points)
+    width = int(max(
+        np.linalg.norm(pts[0] - pts[1]),
+        np.linalg.norm(pts[2] - pts[3])
+    ))
+    height = int(max(
+        np.linalg.norm(pts[1] - pts[2]),
+        np.linalg.norm(pts[3] - pts[0])
+    ))
+
+    dst = np.array([
+        [0, 0],
+        [width - 1, 0],
+        [width - 1, height - 1],
+        [0, height - 1]
+    ], dtype="float32")
+
+    # perspective transform
+    M = cv2.getPerspectiveTransform(pts, dst)
+    warped = cv2.warpPerspective(image, M, (width, height))
+
+    # save result to temp file
+    out_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    cv2.imwrite(out_file.name, warped)
+
+    return send_file(out_file.name, mimetype="image/jpeg")
+    
 if __name__ == '__main__':
     app.run(debug=True, port=5100)
